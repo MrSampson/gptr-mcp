@@ -164,7 +164,19 @@ class ProgressLogHandler:
 
     async def _report(self, message: str) -> None:
         self._step += 1
-        await self._ctx.report_progress(progress=self._step, message=message)
+        try:
+            await self._ctx.report_progress(progress=self._step, message=message)
+        except Exception:
+            # Progress reporting is best-effort telemetry, not part of the
+            # research result. The log_handler path (agent.py's
+            # _log_event) already swallows handler errors so a broken
+            # handler can't take down conduct_research(); the
+            # websocket-shaped stream_output() path this also serves
+            # (gpt_researcher/actions/utils.py) awaits send_json()
+            # unguarded, so without this a transport hiccup here would
+            # propagate out of conduct_research() and discard whatever
+            # research had already completed.
+            logger.warning("Failed to report MCP progress", exc_info=True)
 
 
 def create_research_prompt(topic: str, goal: str, report_format: str = "research_report") -> str:
