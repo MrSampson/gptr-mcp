@@ -98,9 +98,49 @@ def _make_researcher(query: str, ctx: Context) -> GPTResearcher:
     tools pass the same handler instance so the two paths share one
     monotonic progress counter instead of each emitting its own,
     interleaved and out of order.
+
+    Note: only deep_research's conduct_research() actually exercises the
+    websocket path -- quick_search's retriever path
+    (gpt_researcher.actions.query_processing.get_search_results) never
+    calls stream_output, so websocket= is inert during quick_search()
+    itself. It's still wired here, for uniformity and so it works for free
+    if that path ever grows streaming, and because the researcher this
+    returns can later be reused by the standalone write_report tool (see
+    _release_progress_websocket).
     """
     handler = ProgressLogHandler(ctx)
     return GPTResearcher(query, log_handler=handler, websocket=handler)
+
+
+def _release_progress_websocket(researcher: GPTResearcher) -> None:
+    """Clear the progress handler from `websocket` once the request that
+    created it is done searching/scraping, before the researcher is stored
+    in mcp.researchers for reuse by a later call.
+
+    `websocket` is bound to *this* request's MCP context; gpt_researcher's
+    report-writing LLM call disables its normal 10-attempt retry budget
+    whenever a websocket is set (stream=True and websocket is not None ->
+    1 attempt instead of 10; see utils/llm.py) and, separately, re-streams
+    the entire generated report back through it paragraph by paragraph as
+    if it were progress. Neither is wanted for report generation -- the
+    websocket was only ever meant to cover search-loop progress during
+    conduct_research()/quick_search().
+
+    This must run before the researcher is stored, not just before an
+    inline write_report() call: both deep_research(synthesize_report=False)
+    and quick_search() store their researcher in mcp.researchers for the
+    standalone write_report tool to reuse later via research_id/search_id.
+    Without clearing it here, that later call would still carry this
+    request's (by then finished) context, hitting the same retry-budget and
+    duplicate-streaming regression, now silently via the try/except in
+    ProgressLogHandler._report -- and doing so through the tool this fix
+    was supposed to protect.
+
+    (Requires gpt_researcher's ReportGenerator.write_report() to read
+    researcher.websocket live rather than a value captured once at
+    GPTResearcher construction -- see that fork's companion fix.)
+    """
+    researcher.websocket = None
 
 
 @mcp.tool()
@@ -134,6 +174,7 @@ async def deep_research(
     # Start research
     try:
         await researcher.conduct_research()
+        _release_progress_websocket(researcher)
         mcp.researchers[research_id] = researcher
         logger.info(f"Research completed for ID: {research_id}")
 
@@ -156,19 +197,6 @@ async def deep_research(
 
         if synthesize_report:
             logger.info(f"Synthesizing report for research ID: {research_id}")
-            # gpt_researcher's report-writing LLM call disables its normal
-            # retry budget whenever a websocket is set (stream=True and
-            # websocket is not None -> 1 attempt instead of 10; see
-            # utils/llm.py) and, separately, re-streams the entire
-            # generated report back through it paragraph by paragraph as
-            # if it were progress. Neither is wanted here: the websocket
-            # was only ever wired for search-loop progress during
-            # conduct_research(). Clear it before writing the report so a
-            # transient LLM failure gets its real retry budget back.
-            # (Requires gpt_researcher's ReportGenerator.write_report() to
-            # read researcher.websocket live rather than a value captured
-            # once at construction -- see that fork's fix.)
-            researcher.websocket = None
             response_data["report"] = await researcher.write_report()
 
         return create_success_response(response_data)
@@ -199,6 +227,7 @@ async def quick_search(query: str, ctx: Context) -> Dict[str, Any]:
     try:
         # Perform quick search
         search_results = await researcher.quick_search(query=query)
+        _release_progress_websocket(researcher)
         mcp.researchers[search_id] = researcher
         logger.info(f"Quick search completed for ID: {search_id}")
         

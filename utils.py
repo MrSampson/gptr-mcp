@@ -176,7 +176,14 @@ class ProgressLogHandler:
             # unguarded, so without this a transport hiccup here would
             # propagate out of conduct_research() and discard whatever
             # research had already completed.
-            logger.warning("Failed to report MCP progress", exc_info=True)
+            #
+            # loguru does NOT support the standard-library exc_info=
+            # kwarg -- it's silently absorbed as an unused str.format()
+            # argument, producing a log line with no exception type, no
+            # message, and no traceback. logger.opt(exception=True) is
+            # loguru's actual mechanism for attaching the current
+            # exception.
+            logger.opt(exception=True).warning("Failed to report MCP progress")
 
 
 def create_research_prompt(topic: str, goal: str, report_format: str = "research_report") -> str:

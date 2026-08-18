@@ -17,10 +17,23 @@ Regression test for deep_research/quick_search fixes:
    key GPTResearcher.get_research_sources() actually populates, instead of
    a "content" key that was never present -- content_length was 0 for every
    source regardless of how much text was actually scraped.
-4. write_report() is called with the handler's websocket cleared, so
-   gpt_researcher's report-generation LLM call keeps its normal retry
-   budget and doesn't re-stream the whole report back as progress
-   messages (see server.py's deep_research for the full rationale).
+4. The progress websocket is released (set to None) right after
+   conduct_research()/quick_search() completes and before the researcher is
+   stored in mcp.researchers, not just before an inline write_report() call.
+   gpt_researcher's report-generation LLM call disables its normal
+   10-attempt retry budget whenever a websocket is set and re-streams the
+   whole report back through it as fake progress -- neither is wanted for
+   report generation, only for search-loop progress. Releasing it only
+   inside the synthesize_report=True branch left it armed on any researcher
+   later reused by the standalone write_report tool via
+   synthesize_report=False's documented research_id/search_id flow --
+   exactly the workflow this fix exists to protect, hit through a second,
+   easy-to-miss door. See server.py's _release_progress_websocket.
+5. ProgressLogHandler's failure-swallowing log call uses
+   logger.opt(exception=True), not the stdlib-style exc_info=True kwarg --
+   loguru silently discards exc_info= (it's absorbed as an unused
+   str.format() argument), which would otherwise turn every swallowed
+   failure into a traceback-free, undiagnosable log line.
 
 Does not require the real gpt_researcher package: patches server.GPTResearcher
 with a lightweight fake so this runs fast and without network/LLM access.
@@ -30,28 +43,33 @@ Collectible by pytest; also runnable directly:
 """
 
 import asyncio
+import inspect
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("OPENAI_API_KEY", "unused-dummy-value-for-tests")
 
-# Populated by _FakeGPTResearcher.__init__/write_report so assertions can
-# check what server.py actually passed in, independent of the fake's own
-# simulated event counts.
-captured: Dict[str, Any] = {}
-
 
 class _FakeGPTResearcher:
+    # Every constructed instance, in order, so a test can inspect what
+    # server.py actually passed in and to which object -- independent of
+    # the fake's own simulated event counts. Reset at the start of each
+    # test that constructs one.
+    instances: list = []
+
     def __init__(self, query, log_handler=None, websocket=None, **kwargs):
         self.query = query
         self.log_handler = log_handler
         self.websocket = websocket
-        captured["log_handler"] = log_handler
-        captured["websocket"] = websocket
+        # self.websocket gets mutated (cleared) by server.py after
+        # conduct_research(); keep the original construction-time value so
+        # a test can still check what was actually passed in.
+        self.websocket_at_construction = websocket
+        self.websocket_at_write_report = "not-called"
+        _FakeGPTResearcher.instances.append(self)
         self._sources = [
             {"title": "Example", "url": "http://example.com", "raw_content": "x" * 250},
             {"title": "NoContent", "url": "http://example.com/2"},
@@ -78,10 +96,11 @@ class _FakeGPTResearcher:
         return [{"title": "quick", "url": "http://example.com", "snippet": "..."}]
 
     async def write_report(self, custom_prompt=None):
-        # server.py must clear researcher.websocket between
-        # conduct_research() and write_report() -- see that call site for
-        # why (retry budget + duplicate report streaming).
-        captured["websocket_at_write_report"] = self.websocket
+        # server.py must have released the researcher's websocket before
+        # this runs -- either inline (deep_research(synthesize_report=True))
+        # or earlier, before the researcher was stored for reuse by the
+        # standalone write_report tool. See _release_progress_websocket.
+        self.websocket_at_write_report = self.websocket
         return f"# Report for {self.query}\n\nSynthesized findings."
 
     def get_research_context(self):
@@ -101,7 +120,11 @@ async def _run() -> None:
     import server
     from fastmcp import Client
 
+    _FakeGPTResearcher.instances.clear()
+
     with patch("server.GPTResearcher", _FakeGPTResearcher):
+        instances = _FakeGPTResearcher.instances
+
         progress_events = []
 
         async def on_progress(progress, total, message):
@@ -121,15 +144,17 @@ async def _run() -> None:
             # search/scrape loop where these events would really fire.
             assert len(progress_events) >= 4, f"expected >=4 progress events (log_handler + websocket path), got {progress_events}"
 
+            first_researcher = instances[-1]
+
             # The construction itself: both paths must be wired, and to the
             # *same* handler instance -- two separate instances would each
             # keep their own step counter and emit colliding, non-monotonic
             # progress values.
-            assert captured["websocket"] is not None, "websocket= must be wired for search-loop progress"
-            assert captured["websocket"] is captured["log_handler"], "both progress paths must share one handler instance"
+            assert first_researcher.websocket_at_construction is not None, "websocket= must be wired for search-loop progress"
+            assert first_researcher.websocket_at_construction is first_researcher.log_handler, "both progress paths must share one handler instance"
 
-            # Fix 4: websocket must be cleared before write_report() runs.
-            assert captured["websocket_at_write_report"] is None, (
+            # Fix 4: websocket must be cleared before the inline write_report() runs.
+            assert first_researcher.websocket_at_write_report is None, (
                 "write_report() must be called with the researcher's websocket "
                 "cleared, or the report LLM call loses its retry budget and "
                 "the whole report gets re-streamed back as progress"
@@ -145,12 +170,36 @@ async def _run() -> None:
                 "deep_research", {"query": "no report please", "synthesize_report": False}
             )
             assert "report" not in result2.data, "synthesize_report=False must omit report"
+            research_id = result2.data["research_id"]
 
-            # quick_search also reports progress.
+            # Fix 4's second door: a later, standalone write_report call
+            # against a researcher stored via synthesize_report=False must
+            # ALSO see a cleared websocket, not just the inline call above.
+            # The websocket must have been released before storage, not
+            # only inside the synthesize_report=True branch.
+            result4 = await client.call_tool("write_report", {"research_id": research_id})
+            assert result4.data["status"] == "success", result4.data
+            deferred_researcher = instances[-1]
+            assert deferred_researcher.websocket_at_write_report is None, (
+                "a researcher stored via synthesize_report=False and later handed to "
+                "the standalone write_report tool must also see websocket=None -- "
+                "the release must happen before storage, not only before an inline "
+                "write_report() call"
+            )
+
+            # quick_search also reports progress, and its stored researcher
+            # must be released the same way (it can also be reused via
+            # write_report, through the same mcp.researchers dict).
             progress_events.clear()
             result3 = await client.call_tool("quick_search", {"query": "fast query"})
             assert result3.data["status"] == "success", result3.data
             assert len(progress_events) >= 1, "quick_search must report progress too"
+            search_id = result3.data["search_id"]
+
+            result5 = await client.call_tool("write_report", {"research_id": search_id})
+            assert result5.data["status"] == "success", result5.data
+            searched_researcher = instances[-1]
+            assert searched_researcher.websocket_at_write_report is None
 
 
 def test_deep_research_and_quick_search_progress_and_report_fixes() -> None:
@@ -207,8 +256,31 @@ def test_progress_log_handler_swallows_report_progress_failures() -> None:
     asyncio.run(_run_report_progress_failure_does_not_abort())
 
 
+def test_installed_gpt_researcher_reads_websocket_live_at_report_time() -> None:
+    """server.py's _release_progress_websocket() relies on
+    ReportGenerator.write_report() re-reading researcher.websocket live
+    rather than a value frozen into research_params at __init__ time (a
+    separate fix in the gpt-researcher fork). Assert that against whatever
+    is actually installed/pinned right now, so a requirements.txt pin that
+    predates that fix fails loudly here instead of silently shipping a
+    websocket=None clear that the installed package ignores.
+    """
+    from gpt_researcher.skills.writer import ReportGenerator
+
+    source = inspect.getsource(ReportGenerator.write_report)
+    assert 'report_params["websocket"] = self.researcher.websocket' in source, (
+        "installed gpt_researcher's ReportGenerator.write_report() does not "
+        "re-read researcher.websocket live -- server.py's "
+        "_release_progress_websocket() is a no-op against this pin. "
+        "Re-pin requirements.txt to a gpt-researcher commit containing the "
+        "live-read fix (MrSampson/gpt-researcher, "
+        "fix/report-generator-live-websocket) before relying on this."
+    )
+
+
 if __name__ == "__main__":
-    asyncio.run(_run())
-    asyncio.run(_run_send_json_fallbacks())
-    asyncio.run(_run_report_progress_failure_does_not_abort())
+    test_deep_research_and_quick_search_progress_and_report_fixes()
+    test_progress_log_handler_send_json_covers_all_fallback_branches()
+    test_progress_log_handler_swallows_report_progress_failures()
+    test_installed_gpt_researcher_reads_websocket_live_at_report_time()
     print("OK: deep_research/quick_search progress, report synthesis, retry-budget, and content_length fixes verified")
