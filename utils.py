@@ -160,7 +160,11 @@ class ProgressLogHandler:
 
     async def send_json(self, data: Dict[str, Any]) -> None:
         message = data.get("output") or data.get("content") or data.get("type") or "progress"
-        await self._report(str(message))
+        # Most payloads reaching here are short human-readable log lines,
+        # but a few (e.g. the image-planning step's JSON-dumped image
+        # list) can run to multiple KB -- cap so one progress notification
+        # can't balloon.
+        await self._report(str(message)[:200])
 
     async def _report(self, message: str) -> None:
         self._step += 1

@@ -43,10 +43,11 @@ Collectible by pytest; also runnable directly:
 """
 
 import asyncio
-import inspect
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -256,19 +257,61 @@ def test_progress_log_handler_swallows_report_progress_failures() -> None:
     asyncio.run(_run_report_progress_failure_does_not_abort())
 
 
-def test_installed_gpt_researcher_reads_websocket_live_at_report_time() -> None:
+class _StubResearcherForReportGenerator:
+    """Minimal stand-in for GPTResearcher, covering every attribute
+    ReportGenerator.write_report() touches on the non-subtopic path."""
+
+    def __init__(self, websocket):
+        self.query = "q"
+        self.cfg = SimpleNamespace(agent_role="role prompt")
+        self.role = "role"
+        self.report_type = "research_report"
+        self.report_source = "web"
+        self.tone = "objective"
+        self.websocket = websocket
+        self.headers = {}
+        self.verbose = False
+        self.context = "some research context"
+        self.kwargs = {}
+
+    def add_costs(self, *args, **kwargs) -> None:
+        pass
+
+    def get_research_images(self):
+        return []
+
+
+async def _run_installed_gpt_researcher_live_websocket_check() -> None:
     """server.py's _release_progress_websocket() relies on
     ReportGenerator.write_report() re-reading researcher.websocket live
     rather than a value frozen into research_params at __init__ time (a
-    separate fix in the gpt-researcher fork). Assert that against whatever
-    is actually installed/pinned right now, so a requirements.txt pin that
-    predates that fix fails loudly here instead of silently shipping a
-    websocket=None clear that the installed package ignores.
+    separate fix in the gpt-researcher fork). Verify that behaviorally
+    against whatever gpt_researcher is actually installed/pinned right
+    now: construct a real ReportGenerator, mutate websocket after
+    construction the way server.py does, and check what actually reaches
+    generate_report(). This is deliberately behavioral rather than
+    grepping write_report()'s source -- a source-text match breaks on any
+    behavior-preserving refactor (renamed variable, reformatted line, an
+    equally-correct alternative fix shaped differently); asserting on the
+    real call's kwargs does not.
     """
-    from gpt_researcher.skills.writer import ReportGenerator
+    from gpt_researcher.skills import writer
 
-    source = inspect.getsource(ReportGenerator.write_report)
-    assert 'report_params["websocket"] = self.researcher.websocket' in source, (
+    captured: Dict[str, Any] = {}
+
+    async def _fake_generate_report(**kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "report"
+
+    researcher = _StubResearcherForReportGenerator(websocket=object())
+    generator = writer.ReportGenerator(researcher)
+    # Mutate after construction, exactly as _release_progress_websocket does.
+    researcher.websocket = None
+
+    with patch.object(writer, "generate_report", _fake_generate_report):
+        await generator.write_report()
+
+    assert captured.get("websocket") is None, (
         "installed gpt_researcher's ReportGenerator.write_report() does not "
         "re-read researcher.websocket live -- server.py's "
         "_release_progress_websocket() is a no-op against this pin. "
@@ -276,6 +319,10 @@ def test_installed_gpt_researcher_reads_websocket_live_at_report_time() -> None:
         "live-read fix (MrSampson/gpt-researcher, "
         "fix/report-generator-live-websocket) before relying on this."
     )
+
+
+def test_installed_gpt_researcher_reads_websocket_live_at_report_time() -> None:
+    asyncio.run(_run_installed_gpt_researcher_live_websocket_check())
 
 
 if __name__ == "__main__":

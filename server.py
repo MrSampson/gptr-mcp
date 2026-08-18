@@ -113,32 +113,32 @@ def _make_researcher(query: str, ctx: Context) -> GPTResearcher:
 
 
 def _release_progress_websocket(researcher: GPTResearcher) -> None:
-    """Clear the progress handler from `websocket` once the request that
-    created it is done searching/scraping, before the researcher is stored
-    in mcp.researchers for reuse by a later call.
+    """Clear `websocket` once conduct_research()/quick_search() is done,
+    before the researcher is stored in mcp.researchers for reuse by a
+    later call.
 
-    `websocket` is bound to *this* request's MCP context; gpt_researcher's
-    report-writing LLM call disables its normal 10-attempt retry budget
-    whenever a websocket is set (stream=True and websocket is not None ->
-    1 attempt instead of 10; see utils/llm.py) and, separately, re-streams
-    the entire generated report back through it paragraph by paragraph as
-    if it were progress. Neither is wanted for report generation -- the
-    websocket was only ever meant to cover search-loop progress during
-    conduct_research()/quick_search().
+    A non-None `websocket` makes gpt_researcher's report-writing LLM call
+    disable its normal 10-attempt retry budget (stream=True and websocket
+    is not None -> 1 attempt instead of 10; see utils/llm.py) and
+    re-stream the entire generated report back through it, paragraph by
+    paragraph, as if it were progress -- neither wanted for report
+    generation, only for search-loop progress.
 
-    This must run before the researcher is stored, not just before an
-    inline write_report() call: both deep_research(synthesize_report=False)
-    and quick_search() store their researcher in mcp.researchers for the
-    standalone write_report tool to reuse later via research_id/search_id.
-    Without clearing it here, that later call would still carry this
-    request's (by then finished) context, hitting the same retry-budget and
-    duplicate-streaming regression, now silently via the try/except in
-    ProgressLogHandler._report -- and doing so through the tool this fix
-    was supposed to protect.
+    Must run before storage, not just before an inline write_report()
+    call: deep_research(synthesize_report=False) and quick_search() both
+    store their researcher in mcp.researchers, and the standalone
+    write_report tool reuses it later via research_id/search_id -- that
+    reuse needs the same clearing, or it hits the same regression.
 
-    (Requires gpt_researcher's ReportGenerator.write_report() to read
-    researcher.websocket live rather than a value captured once at
-    GPTResearcher construction -- see that fork's companion fix.)
+    Depends on a companion fix in the gpt-researcher fork:
+    ReportGenerator.write_report() must read researcher.websocket live at
+    call time, not the value gpt_researcher/skills/writer.py currently
+    freezes into research_params at GPTResearcher construction. Until that
+    fix is installed, this clear does silence a few verbose progress
+    messages gpt_researcher's write_report() reads live elsewhere (e.g.
+    the "writing_report" ping), but the retry-budget and re-streaming
+    problems above are not yet actually fixed -- see
+    test_installed_gpt_researcher_reads_websocket_live_at_report_time.
     """
     researcher.websocket = None
 
