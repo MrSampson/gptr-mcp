@@ -32,9 +32,10 @@ os.environ.setdefault("OPENAI_API_KEY", "unused-dummy-value-for-tests")
 
 
 class _FakeGPTResearcher:
-    def __init__(self, query, log_handler=None, **kwargs):
+    def __init__(self, query, log_handler=None, websocket=None, **kwargs):
         self.query = query
         self.log_handler = log_handler
+        self.websocket = websocket
         self._sources = [
             {"title": "Example", "url": "http://example.com", "raw_content": "x" * 250},
             {"title": "NoContent", "url": "http://example.com/2"},
@@ -44,6 +45,15 @@ class _FakeGPTResearcher:
         if self.log_handler:
             await self.log_handler.on_research_step("start", {})
             await self.log_handler.on_tool_start("web_search")
+        # Mirrors gpt_researcher's real stream_output() calls
+        # (gpt_researcher/actions/utils.py), made throughout the actual
+        # sub-query search/scrape loop -- the real bottleneck. That's a
+        # separate mechanism from log_handler, gated on `websocket` alone --
+        # this path was never wired to MCP progress before this fix.
+        if self.websocket:
+            await self.websocket.send_json({"type": "logs", "output": "running sub-query 1"})
+            await self.websocket.send_json({"type": "logs", "output": "running sub-query 2"})
+        if self.log_handler:
             await self.log_handler.on_research_step("research_completed", {})
 
     async def quick_search(self, query):
@@ -84,7 +94,12 @@ async def _run() -> None:
             assert data["status"] == "success", data
             assert "report" in data, "synthesize_report defaults True, report must be present"
             assert data["report"].startswith("# Report for test query"), data["report"]
-            assert len(progress_events) >= 3, f"expected >=3 progress events, got {progress_events}"
+            # 2 log_handler checkpoints + 2 websocket-path sub-query events;
+            # the websocket-path count catches the regression this fake
+            # simulates: without websocket= wired, log_handler alone only
+            # covers the coarse macro-checkpoints, not the actual
+            # search/scrape loop where these events would really fire.
+            assert len(progress_events) >= 4, f"expected >=4 progress events (log_handler + websocket path), got {progress_events}"
 
             # Fix 3: content_length reflects raw_content, missing key doesn't crash.
             assert data["sources"][0]["content_length"] == 250, data["sources"]

@@ -117,11 +117,15 @@ async def deep_research(
     # Generate a unique ID for this research session
     research_id = str(uuid.uuid4())
 
-    # Initialize GPT Researcher. log_handler forwards conduct_research()'s
-    # internal step events to MCP progress notifications on this call's
-    # context, so long-running research resets the client's idle timeout
-    # instead of running silently until it finishes or gets aborted.
-    researcher = GPTResearcher(query, log_handler=ProgressLogHandler(ctx))
+    # Initialize GPT Researcher. Pass the same handler as both log_handler
+    # and websocket -- gpt_researcher's coarse macro-checkpoints and its
+    # fine-grained per-sub-query/per-source progress (the one active during
+    # the actual search/scrape work) go through two separate mechanisms;
+    # see ProgressLogHandler's docstring. Without websocket=, a long-running
+    # call produces no MCP progress at all during that phase and can be
+    # aborted by a client's idle timeout despite the service working fine.
+    progress_handler = ProgressLogHandler(ctx)
+    researcher = GPTResearcher(query, log_handler=progress_handler, websocket=progress_handler)
 
     # Start research
     try:
@@ -173,8 +177,10 @@ async def quick_search(query: str, ctx: Context) -> Dict[str, Any]:
     # Generate a unique ID for this search session
     search_id = str(uuid.uuid4())
 
-    # Initialize GPT Researcher
-    researcher = GPTResearcher(query, log_handler=ProgressLogHandler(ctx))
+    # Initialize GPT Researcher. See deep_research's comment above: both
+    # log_handler and websocket are needed for full MCP progress coverage.
+    progress_handler = ProgressLogHandler(ctx)
+    researcher = GPTResearcher(query, log_handler=progress_handler, websocket=progress_handler)
 
     try:
         # Perform quick search
