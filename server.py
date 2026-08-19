@@ -348,14 +348,20 @@ def run_server():
         logger.error("OPENAI_API_KEY not found. Please set it in your .env file.")
         return
 
-    # Determine transport based on environment
-    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-    
-    # Auto-detect Docker environment
-    if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER"):
-        transport = "sse"
-        logger.info("Docker environment detected, using SSE transport")
-    
+    # Determine transport based on environment. An explicit MCP_TRANSPORT
+    # always wins; only fall back to Docker auto-detection when it's unset,
+    # since the auto-detect previously overrode any explicit setting and
+    # silently forced "sse" inside every container regardless of what was
+    # configured.
+    transport = os.getenv("MCP_TRANSPORT")
+    if transport is None:
+        if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER"):
+            transport = "sse"
+            logger.info("Docker environment detected, defaulting to SSE transport")
+        else:
+            transport = "stdio"
+    transport = transport.lower()
+
     # Add startup message
     logger.info(f"Starting GPT Researcher MCP Server with {transport} transport...")
     print(f"🚀 GPT Researcher MCP Server starting with {transport} transport...")
