@@ -6,12 +6,18 @@
 # spark-production branch and services/research/README.md's "Forked
 # gpt-researcher" section for the full rationale. #1943, #1944, #1951 and
 # #1952 landed upstream (in a re-authored form) and were reconciled into
-# spark-production on 2026-08-24 when it was synced with upstream/main;
-# #1960, #1961 and #1967 are still open upstream.
+# spark-production on 2026-08-24 when it was synced with upstream/main.
+# #1960, #1961 and #1967 were closed by the maintainer on 2026-09-26 --
+# each targeted the retired `master` branch and picked up hundreds of
+# unrelated files from the divergence -- and resubmitted as clean PRs
+# against `main`: #2167, #2166 and #2168 respectively, plus #2169 (the
+# live-websocket fix, which had no PR before this). None of these four
+# have merged upstream yet. spark-production was also synced with
+# upstream/main again on 2026-09-26 (81 more commits).
 # Pin to a specific commit, same as the mcp SDK override below -- rebase
 # and bump periodically, dropping whichever fixes upstream has since
 # merged and released.
-gpt-researcher @ git+https://github.com/MrSampson/gpt-researcher.git@41897e5c5a7160f564600e04bb889c7c12c343f4
+gpt-researcher @ git+https://github.com/MrSampson/gpt-researcher.git@8de7e93020b0875f6c07b77e5d64a93732fbcc7a
 python-dotenv
 
 # MCP dependencies
